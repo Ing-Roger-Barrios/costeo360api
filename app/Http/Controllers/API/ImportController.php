@@ -1,1064 +1,522 @@
 <?php
-
 namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
-use App\Models;
 use App\Models\ObraCategoria;
 use App\Models\ObraItem;
-use App\Models\ObraRecursoMaestro; // 👈 FALTABA ESTE IMPORT
+use App\Models\ObraRecursoMaestro;
 use App\Models\ObraModulo;
 use ZipArchive;
 use Exception;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\FacadesLog;
 
 class ImportController extends Controller
 {
-    public function importDdp(Request $request)
+    // Constantes de tamaño
+    const TAMANO_REGISTRO_DAT = 8;
+    const TAMANO_REGISTRO_IND = 92;
+    const TAMANO_REGISTRO_PRE = 460;
+
+    // Configuración de bloques DAT
+    const CONFIG_BLOQUES = [
+        'Material' => ['offset' => 0, 'tamano' => 30, 'fijo' => true],
+        'ManoObra' => ['offset' => 30, 'tamano' => 10, 'fijo' => false],
+        'Equipo' => ['offset' => 40, 'tamano' => 20, 'fijo' => false]
+    ];
+
+    // ========================================================================
+    // MÉTODOS DE LIMPIEZA Y CONVERSIÓN (CORRIGE EL ERROR DE UTF-8)
+    // ========================================================================
+
+    /**
+     * Limpiar y convertir string de Latin-1 a UTF-8 con manejo de caracteres especiales
+     */
+    private function cleanLatin1String($string)
+    {
+        if (!$string || !is_string($string)) {
+            return '';
+        }
+        
+        // Reemplazos críticos para Prescom (caracteres que causan error UTF-8)
+        $criticalReplacements = [
+            "\xB2" => '²',  // m²
+            "\xB3" => '³',  // m³
+            "\xB0" => '°',  // °C
+            "\xF1" => 'ñ',
+            "\xD1" => 'Ñ',
+            "\xA0" => ' ',  // Espacio no separable
+        ];
+        
+        $clean = strtr($string, $criticalReplacements);
+        
+        // Eliminar caracteres de control no imprimibles
+        $clean = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $clean);
+        
+        // Convertir Latin-1 → UTF-8
+        if (!mb_check_encoding($clean, 'UTF-8')) {
+            $clean = mb_convert_encoding($clean, 'UTF-8', 'ISO-8859-1');
+        }
+        
+        // Limpiar UTF-8 inválido restante
+        $clean = mb_convert_encoding($clean, 'UTF-8', 'UTF-8');
+        
+        // Normalizar espacios
+        $clean = preg_replace('/\s+/', ' ', $clean);
+        
+        return trim($clean);
+    }
+
+    // ========================================================================
+    // PARSEO ROBUSTO DE ARCHIVOS .DDP (ADAPTADO DEL SCRIPT PYTHON)
+    // ========================================================================
+
+    /**
+     * Parsear IND - Catálogo de insumos con tipos e índices de precios
+     */
+    private function parseIndFileRobust($filePath)
 {
-    Log::info('Iniciando importación DDP');
-    
-    try {
-        // Validar archivo
-        $request->validate([
-            'file' => 'required|file'
-        ]);
+    $insumos = [];
+    $tipoMap = [
+        0x4D => 'Material',
+        0x4F => 'ManoObra', 
+        0x45 => 'Equipo'
+    ];
 
-        Log::info('Archivo recibido, validación pasada');
+    $handle = fopen($filePath, 'rb');
+    if (!$handle) {
+        throw new \Exception("No se pudo abrir archivo IND: {$filePath}");
+    }
 
-        // Obtener el archivo directamente sin store()
-        $uploadedFile = $request->file('file');
+    $indice = 1; // ID REAL del recurso (empieza en 1, coincide con posición en DAT)
+
+    while (!feof($handle)) {
+        $registro = fread($handle, self::TAMANO_REGISTRO_IND);
+        if (strlen($registro) < self::TAMANO_REGISTRO_IND) {
+            break;
+        }
+
+        // Byte 2 = tipo de insumo
+        $tipoByte = ord($registro[2]);
+        $tipo = $tipoMap[$tipoByte] ?? 'Desconocido';
+
+        // Bytes 88-92 = ID relacionado para buscar precio en DAT
+        $idRelacionadoPrecio = unpack('V', substr($registro, 88, 4))[1];
+
+        // Bytes 4-68: descripción (Latin-1)
+        $descripcionRaw = substr($registro, 3, 63);
+        $descripcion = $this->cleanLatin1String($descripcionRaw);
         
-        // Verificar que el archivo se haya subido correctamente
-        if (!$uploadedFile->isValid()) {
-            Log::error('Archivo no válido: ' . $uploadedFile->getErrorMessage());
-            return response()->json(['error' => 'Archivo .DDP inválido'], 400);
-        }
+        // Bytes 76-80: unidad (Latin-1)
+        /*$unidadRaw = substr($registro, 75, 4);
+        $unidad = $this->cleanLatin1String($unidadRaw);*/
+        $unidad = mb_convert_encoding(substr($registro, 75, 5), 'UTF-8', 'ISO-8859-1');
+        $unidad = trim($unidad);
+        $unidad = rtrim($unidad, "\x00"); // Eliminar null terminators
 
-        // Crear directorio temporal
-        $tempDir = storage_path('app/temp/' . uniqid());
-        if (!is_dir($tempDir)) {
-            mkdir($tempDir, 0755, true);
-        }
-
-        // Guardar archivo temporalmente
-        $tempFilePath = $tempDir . '/archivo.ddp';
-        $uploadedFile->move($tempDir, 'archivo.ddp');
-
-        Log::info('Archivo movido a: ' . $tempFilePath);
-        
-        // Verificar que el archivo exista
-        if (!file_exists($tempFilePath)) {
-            Log::error('Archivo no existe después de mover: ' . $tempFilePath);
-            return response()->json(['error' => 'Error al guardar el archivo temporal'], 500);
-        }
-
-        $fileSize = filesize($tempFilePath);
-        Log::info('Tamaño del archivo: ' . $fileSize . ' bytes');
-
-        if ($fileSize === 0) {
-            Log::error('Archivo vacío');
-            return response()->json(['error' => 'Archivo .DDP vacío'], 400);
-        }
-
-        // Verificar firma ZIP
-        $fileHeader = file_get_contents($tempFilePath, false, null, 0, 4);
-        $zipSignature = "\x50\x4B\x03\x04";
-        
-        if ($fileHeader !== $zipSignature) {
-            Log::error('Archivo no es ZIP válido. Header: ' . bin2hex($fileHeader));
-            return response()->json(['error' => 'Archivo .DDP inválido. No es un archivo ZIP válido.'], 400);
-        }
-
-        Log::info('Archivo ZIP válido detectado');
-
-        // Descomprimir ZIP
-        $zip = new ZipArchive();
-        $openResult = $zip->open($tempFilePath);
-        
-        if ($openResult !== true) {
-            $errorMessages = [
-                ZipArchive::ER_EXISTS => 'El archivo ya existe',
-                ZipArchive::ER_INCONS => 'Archivo ZIP inconsistente',
-                ZipArchive::ER_INVAL => 'Argumento inválido',
-                ZipArchive::ER_MEMORY => 'Fallo de memoria',
-                ZipArchive::ER_NOENT => 'No existe',
-                ZipArchive::ER_NOZIP => 'No es un archivo ZIP',
-                ZipArchive::ER_OPEN => 'No se puede abrir el archivo',
-                ZipArchive::ER_READ => 'Error al leer el archivo',
-                ZipArchive::ER_SEEK => 'Error al buscar en el archivo'
+        // Solo agregar si tiene descripción válida
+        //if (!empty($descripcion)) {
+            $insumos[$indice] = [  // 👈 $indice ES el ID REAL que aparece en el DAT
+                'id' => $indice,     // 👈 GUARDAR EL ID REAL
+                'tipo' => $tipo,
+                'id_relacionado_precio' => $idRelacionadoPrecio,
+                'descripcion' => $descripcion,
+                'unidad' => $unidad
             ];
-            
-            $errorMessage = $errorMessages[$openResult] ?? 'Error desconocido';
-            Log::error('Error al abrir ZIP (' . $openResult . '): ' . $errorMessage);
-            return response()->json(['error' => 'Error al abrir el archivo: ' . $errorMessage], 400);
-        }
-
-        Log::info('ZIP abierto correctamente');
-
-        // Extraer contenido
-        $extractPath = storage_path('app/temp/extracted/' . uniqid());
-        if (!is_dir(dirname($extractPath))) {
-            mkdir(dirname($extractPath), 0755, true);
-        }
-        
-        $zip->extractTo($extractPath);
-        $zip->close();
-
-        Log::info('Contenido extraído a: ' . $extractPath);
-
-        // Buscar archivo .STT
-        $sttFile = $this->findSttFile($extractPath);
-        
-        if (!$sttFile) {
-            Log::warning('No se encontró archivo .STT en: ' . $extractPath);
-            $this->listDirectories($extractPath);
-            return response()->json(['error' => 'No se encontró archivo .STT'], 400);
-        }
-
-        Log::info('Archivo .STT encontrado: ' . $sttFile);
-
-        // Extraer nombre de categoría
-        $nombreCategoria = $this->extractCategoryName($sttFile);
-        
-        if (!$nombreCategoria) {
-            Log::error('No se pudo extraer nombre de categoría');
-            return response()->json(['error' => 'No se pudo extraer el nombre de la categoría'], 400);
-        }
-
-        Log::info('Nombre de categoría extraído: ' . $nombreCategoria);
-
-        // Limpiar archivos temporales
-       // $this->cleanupTempFiles($tempFilePath, $extractPath);
-
-        return response()->json([
-            'success' => true,
-            'nombre_categoria' => $nombreCategoria,
-            'extracted_path' => $extractPath, // 👈 AÑADIR ESTA LÍNEA
-            'preview' => [
-                'categoria' => $nombreCategoria,
-                'mensaje' => 'Listo para crear categoría'
-            ]
-        ]);
-
-    } catch (\Exception $e) {
-        Log::error('Error en importDdp: ' . $e->getMessage() . ' en ' . $e->getFile() . ':' . $e->getLine());
-        
-        // Intentar limpiar cualquier archivo temporal
-        /*if (isset($tempFilePath)) {
-            $this->cleanupTempFiles($tempFilePath, $extractPath ?? '');
-        }*/
-        
-        return response()->json(['error' => 'Error al procesar el archivo'], 500);
+            $indice++;
+        //}
     }
+
+    fclose($handle);
+    Log::info("✓ IND cargado: " . ($indice - 1) . " insumos catalogados (ID real: 1-" . ($indice - 1) . ")");
+    return $insumos;
 }
 
-private function cleanupTempFiles($zipPath, $extractPath)
+    /**
+     * Parsear DAT completo como array indexado
+     */
+    private function parseDatFileRobust($filePath)
+    {
+        $registros = [];
+
+        $handle = fopen($filePath, 'rb');
+        if (!$handle) {
+            throw new \Exception("No se pudo abrir archivo DAT: {$filePath}");
+        }
+
+        $indice = 0;
+
+        while (!feof($handle)) {
+            $registro = fread($handle, self::TAMANO_REGISTRO_DAT);
+            if (strlen($registro) < self::TAMANO_REGISTRO_DAT) {
+                break;
+            }
+
+            $idVal = unpack('V', substr($registro, 0, 4))[1]; // uint32 LE
+            $valor = unpack('f', substr($registro, 4, 4))[1] ?? 0.0; // float32 LE
+
+            if (!is_finite($valor) || abs($valor) > 1e6) {
+                $valor = 0.0;
+            }
+
+            $registros[] = [
+                'indice' => $indice,
+                'id' => $idVal,
+                'valor' => $valor
+            ];
+
+            $indice++;
+        }
+
+        fclose($handle);
+        Log::info("✓ DAT cargado: " . count($registros) . " registros");
+        return $registros;
+    }
+
+    /**
+     * Parsear PRE - Partidas/Items (CORREGIDO UTF-8)
+     */
+    private function parsePreFileRobust($filePath)
 {
-    // Eliminar archivo ZIP temporal
-    if (file_exists($zipPath)) {
-        unlink($zipPath);
-        rmdir(dirname($zipPath));
+    $partidas = [];
+
+    $handle = fopen($filePath, 'rb');
+    if (!$handle) {
+        throw new \Exception("No se pudo abrir archivo PRE: {$filePath}");
+    }
+
+    while (!feof($handle)) {
+        $registro = fread($handle, self::TAMANO_REGISTRO_PRE);
+        if (strlen($registro) < self::TAMANO_REGISTRO_PRE) {
+            break;
+        }
+
+        // Bytes 4-68: descripción (Latin-1)
+        /*$descripcionRaw = substr($registro, 3, 63);
+        $descripcion = $this->cleanLatin1String($descripcionRaw);*/
+        // 👇 CORRECCIÓN CRÍTICA: Extraer bytes crudos y convertir MANUALMENTE de Latin-1 a UTF-8
+        $descripcionRaw = substr($registro, 3, 63);
+        $descripcion = $this->latin1ToUtf8($descripcionRaw);
+        
+        if (empty($descripcion)) {
+            continue;
+        }
+
+        // Bytes 76-80: unidad (Latin-1)
+        /*$unidadRaw = substr($registro, 75, 4);
+        $unidad = $this->cleanLatin1String($unidadRaw);*/
+        /*$unidad = mb_convert_encoding(substr($registro, 75, 5), 'UTF-8', 'ISO-8859-1');
+            $unidad = trim($unidad);*/
+
+        // 👇 CORRECCIÓN CRÍTICA: Unidad con conversión correcta
+        $unidadRaw = substr($registro, 76, 5);
+
+        $unidad = iconv('Windows-1252', 'UTF-8//IGNORE', $unidadRaw);
+
+        $unidad = rtrim($unidad, "\x00");
+
+
+        // Bytes 0-4: ID del módulo
+        $idModulo = unpack('h', substr($registro, 2, 2))[1] ?? 1;
+
+        // 👇 CRÍTICO: Bytes 81-85 = ID relacionado (OFFSET BASE en DAT)
+        $idRelacionado = unpack('V', substr($registro, 81, 4))[1];
+
+        // Bytes 85-89: Rendimiento del item (float32)
+        /*$rendimiento = unpack('f', substr($registro, 85, 8))[1] ?? 1.0;
+        if (!is_finite($rendimiento) || abs($rendimiento) > 1e6) {
+            $rendimiento = 1.0;
+        }*/
+        // Rendimiento (bytes 85-92, double little-endian)
+        $rendimientoBytes = substr($registro, 85, 8);
+        $rendimiento = unpack('e', $rendimientoBytes)[1] ?? 0.0; // 'e' = double (little-endian)
+
+        // Validar rendimiento
+        if (!is_finite($rendimiento) || abs($rendimiento) > 1e6) {
+            $rendimiento = 0.0;
+        }
+
+        $partidas[] = [
+            'id' => count($partidas) + 1,
+            'descripcion' => $descripcion,
+            'unidad' => $unidad,
+            'id_relacionado' => $idRelacionado,  // 👈 GUARDAR EL OFFSET BASE
+            'id_modulo' => $idModulo,
+            'rendimiento' => $rendimiento
+        ];
+    }
+
+    fclose($handle);
+    Log::info("✓ PRE cargado: " . count($partidas) . " partidas (offsets: " . 
+        (count($partidas) > 0 ? $partidas[0]['id_relacionado'] . "..." . end($partidas)['id_relacionado'] : 'N/A') . ")");
+    return $partidas;
+}
+
+
+
+/**
+ * Convertir string de Latin-1 a UTF-8 con manejo de caracteres especiales
+ * Soluciona el problema de "mÂÂ²" → "m²"
+ */
+private function latin1ToUtf8($string)
+{
+    if (!$string || !is_string($string)) {
+        return '';
     }
     
-    // Eliminar directorio extraído
-    if (file_exists($extractPath)) {
-        $this->deleteDirectory($extractPath);
+    // Reemplazos manuales para caracteres problemáticos de Prescom
+    $replacements = [
+        "\xB2" => '²',  // Superíndice 2 (m²)
+        "\xB3" => '³',  // Superíndice 3 (m³)
+        "\xB0" => '°',  // Grados (°C)
+        "\xF1" => 'ñ',
+        "\xD1" => 'Ñ',
+        "\xA0" => ' ',  // Espacio no separable
+        "\xAA" => 'ª',
+        "\xBA" => 'º',
+    ];
+    
+    // Aplicar reemplazos
+    $clean = strtr($string, $replacements);
+    
+    // Eliminar caracteres de control no imprimibles (excepto espacios)
+    $clean = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $clean);
+    
+    // Intentar conversión Latin-1 → UTF-8
+    if (!mb_check_encoding($clean, 'UTF-8')) {
+        $utf8 = mb_convert_encoding($clean, 'UTF-8', 'ISO-8859-1');
+    } else {
+        $utf8 = $clean;
     }
+    
+    // Limpiar UTF-8 inválido restante
+    $utf8 = mb_convert_encoding($utf8, 'UTF-8', 'UTF-8');
+    
+    // Normalizar espacios
+    $utf8 = preg_replace('/\s+/', ' ', $utf8);
+    
+    return trim($utf8);
 }
 
-    private function findSttFile($extractPath)
+    /**
+     * Analizar bloque de insumos (versión robusta)
+     */
+    private function analizarBloqueEstricto($registrosDat, $inicio, $tiposInsumos, $tipoEsperado, $permitirVacio = false, $tamanoBloque = 30)
     {
-        Log::info('Buscando .STT en: ' . $extractPath);
-        
-        $prescomPath = $extractPath . '/PRESCOM_2013/temporal';
-        Log::info('Ruta PRESCOM_2013: ' . $prescomPath);
-        
-        if (!is_dir($prescomPath)) {
-            Log::warning('Directorio PRESCOM_2013/temporal no existe');
-            return null;
+        $insumos = [];
+        $tieneDatos = false;
+        $fin = $inicio + $tamanoBloque;
+
+        for ($i = $inicio; $i < $fin; $i++) {
+            if ($i >= count($registrosDat)) {
+                break;
+            }
+
+            $reg = $registrosDat[$i];
+            if ($reg['id'] == 0) {
+                continue;
+            }
+
+            $tieneDatos = true;
+            $tipoReal = $tiposInsumos[$reg['id']]['tipo'] ?? 'Desconocido';
+
+            // Si el tipo no coincide → bloque inválido
+            if ($tipoReal !== $tipoEsperado) {
+                return [false, []];
+            }
+
+            $insumos[] = [
+                'tipo' => $tipoReal,
+                'id_insumo' => $reg['id'],
+                'coeficiente' => $reg['valor']
+            ];
         }
 
-        // Buscar .STT en mayúsculas
-        $files = glob($prescomPath . '/*.STT');
-        Log::info('Archivos .STT encontrados: ' . count($files));
-        
-        if (!empty($files)) {
-            return $files[0];
-        }
-        
-        // Buscar en minúsculas
-        $files = glob($prescomPath . '/*.stt');
-        if (!empty($files)) {
-            return $files[0];
+        // Bloque vacío pero permitido → válido
+        if (!$tieneDatos && $permitirVacio) {
+            return [true, []];
         }
 
-        return null;
+        // Bloque vacío no permitido → inválido
+        if (!$tieneDatos && !$permitirVacio) {
+            return [false, []];
+        }
+
+        return [true, $insumos];
     }
 
-    private function listDirectories($path)
+    /**
+     * Obtener precio de insumo desde DAT indexado
+     */
+    private function obtenerPrecioInsumo($registrosDat, $idRelacionadoPrecio)
     {
-        if (!is_dir($path)) return;
+        if ($idRelacionadoPrecio == 0 || $idRelacionadoPrecio > count($registrosDat)) {
+            return 0.0;
+        }
+
+        // El ID relacionado es el ÍNDICE en el array DAT (1-based)
+        //$indice = $idRelacionadoPrecio - 1;
+        $indice = $idRelacionadoPrecio  - 1;
+        return $registrosDat[$indice]['valor'] ?? 0.0;
+    }
+
+    /**
+     * Obtener todos los insumos de un item
+     */
+    private function obtenerInsumosItem($registrosDat, $idRelacionado, $tiposInsumos)
+    {
+        $insumosTotales = [];
+        //$base = $idRelacionado - 1; // Convertir a índice base 0
+        $base = $idRelacionado - 1;
+
+        // 1️⃣ MATERIALES (30 registros fijos, puede estar vacío)
+        [$validoMat, $bloqueMat] = $this->analizarBloqueEstricto(
+            $registrosDat,
+            $base,
+            $tiposInsumos,
+            'Material',
+            true,
+            self::CONFIG_BLOQUES['Material']['tamano']
+        );
+
+        if (!$validoMat) {
+            return []; // Item inválido
+        }
+        $insumosTotales = array_merge($insumosTotales, $bloqueMat);
+
+        // 2️⃣ MANO DE OBRA (10 registros opcionales)
+        $bloqueMoInicio = $base + self::CONFIG_BLOQUES['Material']['tamano'];
+        [$validoMo, $bloqueMo] = $this->analizarBloqueEstricto(
+            $registrosDat,
+            $bloqueMoInicio,
+            $tiposInsumos,
+            'ManoObra',
+            true,
+            self::CONFIG_BLOQUES['ManoObra']['tamano']
+        );
+
+        if ($validoMo && !empty($bloqueMo)) {
+            $insumosTotales = array_merge($insumosTotales, $bloqueMo);
+        }
+
+        // 3️⃣ EQUIPOS (20 registros opcionales)
+        $bloqueEqInicio = $base + self::CONFIG_BLOQUES['Material']['tamano'] + self::CONFIG_BLOQUES['ManoObra']['tamano'];
+        [$validoEq, $bloqueEq] = $this->analizarBloqueEstricto(
+            $registrosDat,
+            $bloqueEqInicio,
+            $tiposInsumos,
+            'Equipo',
+            true,
+            self::CONFIG_BLOQUES['Equipo']['tamano']
+        );
+
+        if ($validoEq && !empty($bloqueEq)) {
+            $insumosTotales = array_merge($insumosTotales, $bloqueEq);
+        }
+
+        return $insumosTotales;
+    }
+
+    // ========================================================================
+    // MÉTODOS EXISTENTES (MANTENIDOS SIN CAMBIOS)
+    // ========================================================================
+
+    private function findProjectFiles($extractedPath)
+    {
+        $files = [
+            'stt' => null,
+            'mod' => null,
+            'ind' => null,
+            'pre' => null,
+            'dat' => null
+        ];
         
         $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($path, \RecursiveDirectoryIterator::SKIP_DOTS)
+            new \RecursiveDirectoryIterator($extractedPath, \RecursiveDirectoryIterator::SKIP_DOTS)
         );
         
         foreach ($iterator as $file) {
-            Log::info('Archivo encontrado: ' . $file->getPathname());
-        }
-    }
-
-    private function extractCategoryName($sttFilePath)
-    {
-        try {
-            Log::info('Extrayendo nombre de: ' . $sttFilePath);
-            
-            if (!file_exists($sttFilePath)) {
-                Log::error('Archivo .STT no existe: ' . $sttFilePath);
-                return null;
+            if ($file->isFile()) {
+                $filename = $file->getFilename();
+                if (preg_match('/\.STT$/i', $filename)) {
+                    $files['stt'] = $file->getPathname();
+                } elseif (preg_match('/\.MOD$/i', $filename)) {
+                    $files['mod'] = $file->getPathname();
+                } elseif (preg_match('/\.IND$/i', $filename)) {
+                    $files['ind'] = $file->getPathname();
+                } elseif (preg_match('/\.PRE$/i', $filename)) {
+                    $files['pre'] = $file->getPathname();
+                } elseif (preg_match('/\.DAT$/i', $filename)) {
+                    $files['dat'] = $file->getPathname();
+                }
             }
-
-            $handle = fopen($sttFilePath, 'rb');
-            if (!$handle) {
-                Log::error('No se pudo abrir archivo .STT: ' . $sttFilePath);
-                return null;
-            }
-            
-            $data = fread($handle, 70);
-            fclose($handle);
-            
-            if (strlen($data) < 70) {
-                Log::warning('Archivo .STT muy corto: ' . strlen($data) . ' bytes');
-                return null;
-            }
-            
-            // Decodificar con latin-1 (ISO-8859-1)
-            $nombre = mb_convert_encoding(substr($data, 0, 70), 'UTF-8', 'ISO-8859-1');
-            $nombre = trim($nombre);
-            
-            Log::info('Nombre extraído: "' . $nombre . '"');
-            
-            return $nombre ?: null;
-            
-        } catch (Exception $e) {
-            Log::error('Error extrayendo nombre: ' . $e->getMessage());
-            return null;
-        }
-    }
-
-   
-
-    private function deleteDirectory($dir)
-    {
-        if (!is_dir($dir)) {
-            return;
         }
         
-        $files = array_diff(scandir($dir), ['.', '..']);
-        foreach ($files as $file) {
-            $path = $dir . '/' . $file;
-            if (is_dir($path)) {
-                $this->deleteDirectory($path);
-            } else {
-                unlink($path);
+        $missing = [];
+        foreach (['stt', 'mod', 'ind', 'pre', 'dat'] as $required) {
+            if (!$files[$required]) {
+                $missing[] = strtoupper($required);
             }
         }
-        rmdir($dir);
+        
+        if (!empty($missing)) {
+            throw new \Exception('Archivos esenciales no encontrados en el .DDP: ' . implode(', ', $missing));
+        }
+        
+        return $files;
     }
-    // En ImportController.php
 
     private function parseModFile($modFilePath)
     {
         if (!file_exists($modFilePath)) {
             throw new \Exception('Archivo .MOD no encontrado');
         }
-
+        
         $handle = fopen($modFilePath, 'rb');
         if (!$handle) {
             throw new \Exception('No se pudo abrir archivo .MOD');
         }
-
+        
         $modulos = [];
         $moduleId = 1;
         $recordSize = 50;
-
+        
         while (!feof($handle)) {
             $data = fread($handle, $recordSize);
             if (strlen($data) < $recordSize) {
                 break;
             }
-
+            
             // Decodificar nombre
-            $nombre = mb_convert_encoding($data, 'UTF-8', 'ISO-8859-1');
-            $nombre = trim($nombre);
-
+            $nombre = $this->cleanLatin1String($data);
+            
             // Saltar registros vacíos o muy cortos
             if ($nombre && strlen($nombre) >= 3) {
                 // Detectar comentarios
-                $esComentario = strpos($nombre, '«') === 0 || 
-                            strpos($nombre, '»') === 0 || 
-                            strpos($nombre, '"') === 0;
-
+                $esComentario = strpos($nombre, '«') === 0 ||
+                               strpos($nombre, '»') === 0 ||
+                               strpos($nombre, '"') === 0;
+                
                 $modulos[] = [
                     'id' => $moduleId,
                     'nombre' => $nombre,
                     'es_comentario' => $esComentario
                 ];
-
                 $moduleId++;
             }
         }
-
+        
         fclose($handle);
         return $modulos;
     }
-    // En ImportController.php
 
-    private function parsePreFile($preFilePath)
-    {
-        if (!file_exists($preFilePath)) {
-            throw new \Exception('Archivo .PRE no encontrado');
-        }
+    // ========================================================================
+    // MÉTODO PRINCIPAL DE IMPORTACIÓN (ADAPTADO CON LÓGICA ROBUSTA)
+    // ========================================================================
 
-        $handle = fopen($preFilePath, 'rb');
-        if (!$handle) {
-            throw new \Exception('No se pudo abrir archivo .PRE');
-        }
-
-        $partidas = [];
-        $itemId = 1;
-        $recordSize = 460;
-
-        while (!feof($handle)) {
-            $data = fread($handle, $recordSize);
-            if (strlen($data) < $recordSize) {
-                break;
-            }
-
-            try {
-                // ID módulo (bytes 2-3, uint16 little-endian)
-                $moduleIdBytes = substr($data, 2, 2);
-                $moduleId = unpack('v', $moduleIdBytes)[1]; // 'v' = unsigned short (little-endian)
-
-                // Descripción (bytes 4-67, 64 bytes)
-                $descripcion = mb_convert_encoding(substr($data, 4, 64), 'UTF-8', 'ISO-8859-1');
-                $descripcion = trim($descripcion);
-
-                // Saltar descripciones vacías
-                if (!$descripcion || strlen($descripcion) < 3) {
-                    continue;
-                }
-
-                // Unidad (bytes 76-79, 4 bytes)
-                $unidad = mb_convert_encoding(substr($data, 76, 4), 'UTF-8', 'ISO-8859-1');
-                $unidad = trim($unidad);
-
-                // Rendimiento (bytes 85-92, double little-endian)
-                $rendimientoBytes = substr($data, 85, 8);
-                $rendimiento = unpack('e', $rendimientoBytes)[1] ?? 0.0; // 'e' = double (little-endian)
-
-                // Validar rendimiento
-                if (!is_finite($rendimiento) || abs($rendimiento) > 1e6) {
-                    $rendimiento = 0.0;
-                }
-
-                $partidas[] = [
-                    'id' => $itemId,
-                    'id_modulo' => $moduleId,
-                    'descripcion' => $descripcion,
-                    'unidad' => $unidad,
-                    'rendimiento' => $rendimiento
-                ];
-
-                $itemId++;
-
-            } catch (\Exception $e) {
-                Log::warning('Error parsing partida: ' . $e->getMessage());
-                continue;
-            }
-        }
-
-        fclose($handle);
-        return $partidas;
-    }
-    public function importModulesAndItems(Request $request)
-    {
-        try {
-            $request->validate([
-                'category_id' => 'required|exists:obra_categorias,id',
-                'extracted_path' => 'required|string'
-            ]);
-
-            $categoryId = $request->category_id;
-            $extractedPath = $request->extracted_path;
-
-            // Buscar archivos .MOD y .PRE
-            $modFile = $this->findFileInPath($extractedPath, ['*.MOD', '*.mod']);
-            $preFile = $this->findFileInPath($extractedPath, ['*.PRE', '*.pre']);
-
-            if (!$modFile || !$preFile) {
-                return response()->json([
-                    'error' => 'Archivos .MOD o .PRE no encontrados'
-                ], 400);
-            }
-
-            // Parsear archivos
-            $modulos = $this->parseModFile($modFile);
-            $partidas = $this->parsePreFile($preFile);
-
-            // Crear módulos en la base de datos
-            $createdModules = [];
-            foreach ($modulos as $modulo) {
-                if (!$modulo['es_comentario']) {
-                    $dbModule = ObraModulo::create([
-                        'categoria_id' => $categoryId,
-                        'codigo' => 'MOD_' . str_pad($modulo['id'], 3, '0', STR_PAD_LEFT),
-                        'nombre' => $modulo['nombre'],
-                        'descripcion' => 'Importado desde .DDP',
-                        'activo' => true
-                    ]);
-                    
-                    $createdModules[$modulo['id']] = $dbModule->id;
-                }
-            }
-
-            // Crear items/partidas
-            $createdItems = [];
-            foreach ($partidas as $partida) {
-                // Verificar que el módulo exista
-                if (!isset($createdModules[$partida['id_modulo']])) {
-                    continue;
-                }
-
-                $dbItem = ObraItem::create([
-                    'modulo_id' => $createdModules[$partida['id_modulo']],
-                    'codigo' => 'ITEM_' . str_pad($partida['id'], 4, '0', STR_PAD_LEFT),
-                    'descripcion' => $partida['descripcion'],
-                    'unidad' => $partida['unidad'],
-                    'rendimiento' => $partida['rendimiento'],
-                    'activo' => true
-                ]);
-
-                $createdItems[] = $dbItem;
-            }
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Módulos e items importados exitosamente',
-                'stats' => [
-                    'modulos' => count($createdModules),
-                    'items' => count($createdItems)
-                ]
-            ]);
-
-        } catch (\Exception $e) {
-            Log::error('Error importing modules and items: ' . $e->getMessage());
-            return response()->json(['error' => 'Error al importar módulos e items'], 500);
-        }
-    }
-
-    private function findFileInPath($path, $patterns)
-    {
-        foreach ($patterns as $pattern) {
-            $files = glob($path . '/' . $pattern);
-            if (!empty($files)) {
-                return $files[0];
-            }
-        }
-        return null;
-    }
-    private function parseIndFile($indFilePath)
-{
-    if (!file_exists($indFilePath)) {
-        throw new \Exception('Archivo .IND no encontrado');
-    }
-
-    $handle = fopen($indFilePath, 'rb');
-    if (!$handle) {
-        throw new \Exception('No se pudo abrir archivo .IND');
-    }
-
-    $insumos = [];
-    $contador = 1;
-    $recordSize = 92;
-
-    // Mapa de tipos
-    $tipoMap = [
-        0x4D => 'Material',    // 'M'
-        0x4F => 'ManoObra',   // 'O' 
-        0x45 => 'Equipo'      // 'E'
-    ];
-
-    while (!feof($handle)) {
-        $data = fread($handle, $recordSize);
-        if (strlen($data) < $recordSize) {
-            break;
-        }
-
-        try {
-            // ID relacionado (bytes 88-91, uint32 little-endian)
-            $idRelacionadoBytes = substr($data, 88, 4);
-            $idRelacionado = unpack('V', $idRelacionadoBytes)[1]; // 'V' = unsigned long (little-endian)
-
-            // Tipo (byte 2)
-            $tipoByte = ord($data[2]);
-            $tipo = $tipoMap[$tipoByte] ?? 'Desconocido';
-
-            // Descripción (bytes 3-74, 72 bytes)
-            $descripcion = mb_convert_encoding(substr($data, 3, 70), 'UTF-8', 'ISO-8859-1');
-            $descripcion = trim($descripcion);
-
-            // Saltar descripciones vacías
-            if (!$descripcion || strlen($descripcion) < 3) {
-                continue;
-            }
-
-            // Unidad (bytes 75-78, 4 bytes)
-            $unidad = mb_convert_encoding(substr($data, 75, 4), 'UTF-8', 'ISO-8859-1');
-            $unidad = trim($unidad);
-            $unidad = rtrim($unidad, "\x00"); // Eliminar null terminators
-
-            // Precio (bytes 80-87, double little-endian)
-            $precioBytes = substr($data, 80, 8);
-            $precio = unpack('e', $precioBytes)[1] ?? 0.0;
-
-            if (!is_finite($precio) || abs($precio) > 1e6) {
-                $precio = 0.0;
-            }
-
-            $insumos[] = [
-                'id' => $contador,
-                'id_relacionado' => $idRelacionado,
-                'tipo' => $tipo,
-                'descripcion' => $descripcion,
-                'unidad' => $unidad,
-                'precio' => $precio
-            ];
-
-            $contador++;
-
-        } catch (\Exception $e) {
-            Log::warning('Error parsing insumo: ' . $e->getMessage());
-            continue;
-        }
-    }
-
-    fclose($handle);
-    return $insumos;
-}
-// En ImportController.php
-
-// En ImportController.php
-
-/*private function parseDatFile($datFilePath)
-{
-    if (!file_exists($datFilePath)) {
-        throw new \Exception('Archivo .DAT no encontrado');
-    }
-
-    $handle = fopen($datFilePath, 'rb');
-    if (!$handle) {
-        throw new \Exception('No se pudo abrir archivo .DAT');
-    }
-
-    try {
-        // Leer precios de insumos (8 bytes por registro: 4 bytes ID + 4 bytes precio)
-        $preciosInsumos = [];
-        
-        while (!feof($handle)) {
-            $data = fread($handle, 8);
-            if (strlen($data) < 8) {
-                break;
-            }
-            
-            // ID relacionado (bytes 0-3, uint32 little-endian)
-            $idRelacionado = unpack('V', substr($data, 0, 4))[1];
-            
-            // Precio (bytes 4-7, float32 little-endian)
-            $precio = unpack('f', substr($data, 4, 4))[1] ?? 0.0;
-            
-            if (!is_finite($precio) || abs($precio) > 1e6) {
-                $precio = 0.0;
-            }
-            
-            $preciosInsumos[] = $precio;
-        }
-        
-        return [
-            'precios_insumos' => $preciosInsumos,
-            'recursos_por_item' => [] // Implementaremos esto después
-        ];
-        
-    } finally {
-        fclose($handle);
-    }
-}*/
-
-// En ImportController.php
-
-private function parsePreciosInsumos($handle, $insumos)
-{
-    $precios = [];
-    
-    foreach ($insumos as $insumo) {
-        $precioBytes = fread($handle, 8); // 8 bytes totales por registro
-        if (strlen($precioBytes) < 8) {
-            break;
-        }
-        
-        // ID relacionado (bytes 0-3, uint32 little-endian)
-        $idRelacionado = unpack('V', substr($precioBytes, 0, 4))[1];
-        
-        // Precio (bytes 4-7, float32 little-endian)
-        $precio = unpack('f', substr($precioBytes, 4, 4))[1] ?? 0.0;
-        
-        if (!is_finite($precio) || abs($precio) > 1e6) {
-            $precio = 0.0;
-        }
-        
-        $precios[$idRelacionado] = $precio;
-    }
-    
-    return $precios;
-}
-private function findProjectFiles($extractedPath)
-{
-    Log::info('Contenido de la ruta extraída:');
-    
-    $iterator = new \RecursiveIteratorIterator(
-        new \RecursiveDirectoryIterator($extractedPath, \RecursiveDirectoryIterator::SKIP_DOTS)
-    );
-    
-    foreach ($iterator as $file) {
-        if ($file->isFile()) {
-            Log::info('Archivo encontrado: ' . $file->getPathname());
-        }
-    }
-
-    // Buscar recursivamente todos los archivos necesarios
-    $files = [
-        'stt' => null,
-        'mod' => null, 
-        'ind' => null,
-        'pre' => null,
-        'dat' => null
-    ];
-
-    $iterator = new \RecursiveIteratorIterator(
-        new \RecursiveDirectoryIterator($extractedPath, \RecursiveDirectoryIterator::SKIP_DOTS)
-    );
-
-    foreach ($iterator as $file) {
-        if ($file->isFile()) {
-            $filename = $file->getFilename();
-            
-            if (preg_match('/\.STT$/i', $filename)) {
-                $files['stt'] = $file->getPathname();
-            } elseif (preg_match('/\.MOD$/i', $filename)) {
-                $files['mod'] = $file->getPathname();
-            } elseif (preg_match('/\.IND$/i', $filename)) {
-                $files['ind'] = $file->getPathname();
-            } elseif (preg_match('/\.PRE$/i', $filename)) {
-                $files['pre'] = $file->getPathname();
-            } elseif (preg_match('/\.DAT$/i', $filename)) {
-                $files['dat'] = $file->getPathname();
-            }
-        }
-    }
-
-    // Verificación detallada
-    $missing = [];
-    foreach (['stt', 'mod', 'ind', 'pre', 'dat'] as $required) {
-        if (!$files[$required]) {
-            $missing[] = strtoupper($required);
-        }
-    }
-    
-    if (!empty($missing)) {
-        Log::error('Archivos faltantes: ' . implode(', ', $missing));
-        throw new \Exception('Archivos esenciales no encontrados en el .DDP');
-    }
-
-    return $files;
-}
-private function crearRecursosMaestros($insumos, $preciosInsumos)
-{
-    $recursosCreados = [];
-    
-    foreach ($insumos as $insumo) {
-        $recurso = ObraRecursoMaestro::create([
-            'codigo' => 'REC_' . str_pad($insumo['id'], 4, '0', STR_PAD_LEFT),
-            'nombre' => $insumo['descripcion'],
-            'tipo' => $insumo['tipo'],
-            'unidad' => $insumo['unidad'],
-            'precio_referencia' => $preciosInsumos[$insumo['id_relacionado']] ?? $insumo['precio'],
-            'descripcion' => 'Importado desde .DDP',
-            'activo' => true
-        ]);
-        
-        $recursosCreados[] = $recurso;
-    }
-    
-    return $recursosCreados;
-}
-
-private function crearModulos($modulos, $categoriaId)
-{
-    $modulosCreados = [];
-    
-    foreach ($modulos as $modulo) {
-        if (!$modulo['es_comentario']) {
-            $dbModule = ObraModulo::create([
-                'categoria_id' => $categoriaId,
-                'codigo' => 'MOD_' . str_pad($modulo['id'], 3, '0', STR_PAD_LEFT),
-                'nombre' => $modulo['nombre'],
-                'descripcion' => 'Importado desde .DDP',
-                'activo' => true
-            ]);
-            
-            $modulosCreados[$modulo['id']] = $dbModule->id;
-        }
-    }
-    
-    return $modulosCreados;
-}
-
-private function crearItems($partidas, $modulosCreados, $recursosCreados, $recursosPorItem)
-{
-    $itemsCreados = [];
-    
-    foreach ($partidas as $partida) {
-        if (!isset($modulosCreados[$partida['id_modulo']])) {
-            continue;
-        }
-
-        $dbItem = ObraItem::create([
-            'modulo_id' => $modulosCreados[$partida['id_modulo']],
-            'codigo' => 'ITEM_' . str_pad($partida['id'], 4, '0', STR_PAD_LEFT),
-            'descripcion' => $partida['descripcion'],
-            'unidad' => $partida['unidad'],
-            'rendimiento' => $partida['rendimiento'],
-            'activo' => true
-        ]);
-
-        $itemsCreados[] = $dbItem;
-    }
-    
-    return $itemsCreados;
-}
-
-// En ImportController.php
-private function parseRecursosPorItem($handle, $ultimoIdRecurso)
-{
-    $recursosPorItem = [];
-    $itemId = 1;
-    
-    while (!feof($handle)) {
-        $itemRecursos = [
-            'materiales' => [],
-            'mano_obra' => [],
-            'equipos' => []
-        ];
-        
-        $hasData = false;
-        $tipos = ['materiales', 'mano_obra', 'equipos'];
-        
-        foreach ($tipos as $tipo) {
-            $blockData = fread($handle, 240);
-            if (strlen($blockData) < 240) {
-                // Fin del archivo
-                if (!$hasData) {
-                    return $recursosPorItem;
-                }
-                break;
-            }
-            
-            // Parsear el bloque de 240 bytes
-            $recursos = $this->parseBloqueRecursos240($blockData, $ultimoIdRecurso);
-            if (!empty($recursos)) {
-                $itemRecursos[$tipo] = $recursos;
-                $hasData = true;
-            }
-        }
-        
-        if ($hasData) {
-            $recursosPorItem[$itemId] = $itemRecursos;
-            $itemId++;
-        } else {
-            // Si no hay datos en ningún bloque, asumimos fin del archivo
-            break;
-        }
-    }
-    
-    return $recursosPorItem;
-}
-private function parseBloqueRecursos240($blockData, $ultimoIdRecurso)
-{
-    $recursos = [];
-    $offset = 0;
-    $recordSize = 8; // 4 bytes ID + 4 bytes rendimiento
-    
-    while ($offset + $recordSize <= 240) {
-        $registro = substr($blockData, $offset, $recordSize);
-        
-        // Verificar si el registro está vacío
-        if (unpack('L', substr($registro, 0, 4))[1] === 0) {
-            $offset += $recordSize;
-            continue;
-        }
-        
-        // Extraer ID del recurso
-        $idRecurso = unpack('V', substr($registro, 0, 4))[1]; // uint32 LE
-        
-        // Verificar si el ID es válido (menor o igual al último ID de recursos)
-        if ($idRecurso > $ultimoIdRecurso || $idRecurso <= 0) {
-            // Este registro marca el inicio de un nuevo item
-            break;
-        }
-        
-        // Extraer rendimiento
-        $rendimiento = unpack('f', substr($registro, 4, 4))[1] ?? 0.0;
-        if (!is_finite($rendimiento) || abs($rendimiento) > 1e6) {
-            $rendimiento = 0.0;
-        }
-        
-        $recursos[] = [
-            'recurso_id' => $idRecurso,
-            'rendimiento' => $rendimiento
-        ];
-        
-        $offset += $recordSize;
-    }
-    
-    return $recursos;
-}
-private function parseDatFile($datFilePath, $insumos)
-{
-    if (!file_exists($datFilePath)) {
-        throw new \Exception('Archivo .DAT no encontrado');
-    }
-
-    // Crear mapa de tipos de insumos (ID => Tipo)
-    $tiposInsumos = [];
-    foreach ($insumos as $insumo) {
-        $tiposInsumos[$insumo['id_relacionado']] = $insumo['tipo'];
-    }
-
-    $handle = fopen($datFilePath, 'rb');
-    if (!$handle) {
-        throw new \Exception('No se pudo abrir archivo .DAT');
-    }
-
-    try {
-        // Parte A: Precios correlativos
-        $precios = [];
-        $lastId = 0;
-        
-        while (!feof($handle)) {
-            $data = fread($handle, 8);
-            if (strlen($data) < 8) {
-                break;
-            }
-            
-            $idVal = unpack('V', substr($data, 0, 4))[1]; // uint32 LE
-            $precio = unpack('f', substr($data, 4, 4))[1] ?? 0.0;
-            
-            if (!is_finite($precio) || abs($precio) > 1e6) {
-                $precio = 0.0;
-            }
-            
-            // Detectar ruptura correlativa
-            if ($lastId > 0 && $idVal != $lastId + 1) {
-                // Retroceder 8 bytes para que este registro sea parte de las relaciones
-                fseek($handle, -8, SEEK_CUR);
-                break;
-            }
-            
-            $precios[] = $precio;
-            $lastId = $idVal;
-        }
-
-        // Parte B: Relaciones por item
-        $relaciones = [];
-        $itemActual = 1;
-        $estado = 'MATERIAL'; // Siempre empieza con Material
-
-        while (!feof($handle)) {
-            $bloque = fread($handle, 240);
-            if (strlen($bloque) < 240) {
-                break;
-            }
-            
-            // Bloque vacío
-            if ($this->esBloqueVacio($bloque)) {
-                if ($estado === 'MATERIAL') {
-                    // Item sin materiales
-                    $estado = 'POST_MATERIAL';
-                    continue;
-                } else {
-                    // Fin del item actual
-                    $itemActual++;
-                    $estado = 'MATERIAL';
-                    continue;
-                }
-            }
-            
-            // Detectar tipo del bloque
-            $idInicio = $this->primerIdValido($bloque);
-            if ($idInicio === null) {
-                continue;
-            }
-            
-            $tipoInicio = $tiposInsumos[$idInicio] ?? 'Desconocido';
-            
-            // Nuevo item detectado
-            if ($tipoInicio === 'Material' && $estado !== 'MATERIAL') {
-                $itemActual++;
-                $estado = 'MATERIAL';
-            }
-            
-            // Procesar registros del bloque
-            for ($i = 0; $i < 240; $i += 8) {
-                $chunk = substr($bloque, $i, 8);
-                
-                if ($this->esRegistroVacio($chunk)) {
-                    continue;
-                }
-                
-                $insId = unpack('V', substr($chunk, 0, 4))[1];
-                $rendimiento = unpack('f', substr($chunk, 4, 4))[1] ?? 0.0;
-                
-                if (!is_finite($rendimiento) || abs($rendimiento) > 1e6) {
-                    $rendimiento = 0.0;
-                }
-                
-                if ($insId == 0) {
-                    continue;
-                }
-                
-                $tipo = $tiposInsumos[$insId] ?? 'Desconocido';
-                
-                $relaciones[] = [
-                    'item' => $itemActual,
-                    'tipo' => $tipo,
-                    'id_insumo' => $insId,
-                    'rendimiento' => $rendimiento
-                ];
-            }
-            
-            // Actualizar estado
-            if ($tipoInicio === 'Material') {
-                $estado = 'POST_MATERIAL';
-            } else {
-                $estado = 'POST_OTROS';
-            }
-        }
-        
-        return [
-            'precios_insumos' => $precios,
-            'relaciones' => $relaciones
-        ];
-        
-    } finally {
-        fclose($handle);
-    }
-}
-private function esBloqueVacio($bloque)
-{
-    return $bloque === str_repeat("\x00", 240);
-}
-
-private function esRegistroVacio($registro)
-{
-    return $registro === str_repeat("\x00", 8);
-}
-
-private function primerIdValido($bloque)
-{
-    for ($i = 0; $i < 240; $i += 8) {
-        $chunk = substr($bloque, $i, 8);
-        if (!$this->esRegistroVacio($chunk)) {
-            $insId = unpack('V', substr($chunk, 0, 4))[1];
-            if ($insId > 0) {
-                return $insId;
-            }
-        }
-    }
-    return null;
-}
-/*private function parseRecursosPorItem($handle)
-{
-    $recursosPorItem = [];
-    $itemId = 1;
-    
-    while (!feof($handle)) {
-        $itemRecursos = [
-            'materiales' => [],
-            'mano_obra' => [],
-            'equipos' => []
-        ];
-        
-        $hasData = false;
-        $tipos = ['materiales', 'mano_obra', 'equipos'];
-        
-        foreach ($tipos as $tipo) {
-            $blockData = fread($handle, 240);
-            if (strlen($blockData) < 240) {
-                // Fin del archivo
-                if (!$hasData) {
-                    return $recursosPorItem;
-                }
-                break;
-            }
-            
-            // Verificar si el bloque contiene datos reales
-            $recursos = $this->parseBloqueRecursos240($blockData, $tipo);
-            if (!empty($recursos)) {
-                $itemRecursos[$tipo] = $recursos;
-                $hasData = true;
-            }
-        }
-        
-        if ($hasData) {
-            $recursosPorItem[$itemId] = $itemRecursos;
-            $itemId++;
-        } else {
-            // Si no hay datos en ningún bloque, asumimos fin del archivo
-            break;
-        }
-    }
-    
-    return $recursosPorItem;
-}*/
-
-/*private function parseBloqueRecursos240($blockData, $tipoRecurso)
-{
-    $recursos = [];
-    
-    // Analizar los 240 bytes según la estructura de Prescom
-    // Esta es una implementación básica - necesitarás ajustar según la estructura exacta
-    
-    // Verificar si el bloque está vacío (todos ceros o espacios)
-    if (trim($blockData) === '' || unpack('L', substr($blockData, 0, 4))[1] === 0) {
-        return $recursos;
-    }
-    
-    // Aquí iría la lógica específica para parsear los 240 bytes
-    // Por ahora, devolvemos información básica para debugging
-    $recursos[] = [
-        'tipo' => $tipoRecurso,
-        'datos_hex' => bin2hex(substr($blockData, 0, 32)), // Primeros 32 bytes para debugging
-        'tamaño_bloque' => strlen($blockData)
-    ];
-    
-    return $recursos;
-}*/
-
-
-public function importCompleteProject(Request $request)
+    public function importCompleteProject(Request $request)
 {
     try {
         $request->validate([
@@ -1076,42 +534,47 @@ public function importCompleteProject(Request $request)
             'activo' => true
         ]);
 
-        // 2. Encontrar y parsear archivos
-        $files = $this->findProjectFiles($request->extracted_path);
-        $insumos = $this->parseIndFile($files['ind']);
-        $modulos = $this->parseModFile($files['mod']);
-        $partidas = $this->parsePreFile($files['pre']);
-        $datosDat = $this->parseDatFile($files['dat'], $insumos);
-        $preciosDat = $datosDat['precios_insumos'];
-        $relaciones = $datosDat['relaciones'];
+        Log::info("✓ Categoría creada: {$categoria->id} - {$categoria->nombre}");
 
-        // 3. Crear recursos maestros
-        // Reemplazar la sección de creación de recursos
-        // 3. Crear/actualizar recursos maestros (únicos por descripcion + unidad)
-        // 3. Crear/actualizar recursos maestros (únicos por nombre + unidad)
-        foreach ($insumos as $index => $insumo) {
-            // Obtener precio del .DAT (mismo orden que .IND)
-            $precioDesdeDat = isset($preciosDat[$index]) ? $preciosDat[$index] : $insumo['precio'];
+        // 2. Encontrar y parsear archivos con métodos ROBUSTOS
+        $files = $this->findProjectFiles($request->extracted_path);
+        
+        $insumos = $this->parseIndFileRobust($files['ind']);      // Catálogo con ID real
+        $registrosDat = $this->parseDatFileRobust($files['dat']);  // Array indexado completo de DAT
+        $modulos = $this->parseModFile($files['mod']);             // Módulos (sin cambios)
+        $partidas = $this->parsePreFileRobust($files['pre']);      // Items con offset base
+
+        Log::info("✓ Archivos parseados:");
+        Log::info("  - Insumos: " . count($insumos) . " (ID real: 1-" . count($insumos) . ")");
+        Log::info("  - Registros DAT: " . count($registrosDat));
+        Log::info("  - Partidas: " . count($partidas));
+
+        // 3. Crear/actualizar recursos maestros (indexados por ID REAL)
+        $recursosMap = []; // 👈 MAPA indexado por ID REAL del recurso (1, 2, 3... 7815)
+        foreach ($insumos as $idReal => $insumo) {  // 👈 $idReal es el ID que aparece en el DAT
+            // Obtener precio usando el índice de precio del IND
+            $precioDesdeDat = $this->obtenerPrecioInsumo($registrosDat, $insumo['id_relacionado_precio']);
+            
             // Limpiar los campos antes de usarlos
-            $nombreLimpio = $this->cleanString($insumo['descripcion']);
-            $unidadLimpia = $this->cleanString($insumo['unidad']);
+            $nombreLimpio = $this->cleanLatin1String($insumo['descripcion']);
+            $unidadLimpia = $this->cleanLatin1String($insumo['unidad']);
+            
             // Buscar recurso existente por nombre + unidad LIMPIOS
             $recurso = ObraRecursoMaestro::whereRaw('TRIM(nombre) = ?', [$nombreLimpio])
                                         ->whereRaw('TRIM(unidad) = ?', [$unidadLimpia])
                                         ->first();
             
             if ($recurso) {
-                // Si existe, solo actualizar campos que pueden cambiar
                 $recurso->update([
                     'tipo' => $insumo['tipo'],
                     'precio_referencia' => $precioDesdeDat,
                     'descripcion' => 'Importado desde .DDP',
                     'activo' => true
                 ]);
+                Log::info("  ↳ Recurso existente actualizado: {$recurso->id} - {$nombreLimpio}");
             } else {
-                // Si no existe, crear nuevo con código único
                 $recurso = ObraRecursoMaestro::create([
-                    'codigo' => 'REC_' . str_pad($insumo['id'], 4, '0', STR_PAD_LEFT) . '_' . time(),
+                    'codigo' => 'REC_' . str_pad($idReal, 4, '0', STR_PAD_LEFT) . '_' . time(),
                     'nombre' => $insumo['descripcion'],
                     'tipo' => $insumo['tipo'],
                     'unidad' => $insumo['unidad'],
@@ -1119,8 +582,14 @@ public function importCompleteProject(Request $request)
                     'descripcion' => 'Importado desde .DDP',
                     'activo' => true
                 ]);
+                Log::info("  ↳ Recurso nuevo creado: {$recurso->id} - {$nombreLimpio}");
             }
+            
+            // 👇 GUARDAR EN MAPA POR ID REAL (no por posición)
+            $recursosMap[$idReal] = $recurso->id;
         }
+
+        Log::info("✓ Recursos procesados: " . count($recursosMap));
 
         // 4. Crear módulos y establecer relación con categoría
         $createdModules = [];
@@ -1128,7 +597,6 @@ public function importCompleteProject(Request $request)
         
         foreach ($modulos as $modulo) {
             if (!$modulo['es_comentario']) {
-                // SIEMPRE crear un nuevo módulo
                 $dbModule = ObraModulo::create([
                     'codigo' => 'MOD_' . str_pad($modulo['id'], 3, '0', STR_PAD_LEFT) . '_' . time() . '_' . rand(100, 999),
                     'nombre' => $modulo['nombre'],
@@ -1136,118 +604,132 @@ public function importCompleteProject(Request $request)
                     'activo' => true
                 ]);
                 
-                // Establecer relación con la categoría
                 $categoria->modulos()->attach($dbModule->id, ['orden' => $orden]);
-                
                 $createdModules[$modulo['id']] = $dbModule->id;
+                Log::info("✓ Módulo creado: {$dbModule->id} - {$dbModule->nombre} (orden: {$orden})");
                 $orden++;
             }
         }
 
-        // 5. Crear items
-        // 5. Crear/actualizar items (únicos por descripcion + unidad)
-        // 5. Crear/actualizar items (únicos por descripcion + unidad)
-        // 5. Crear/actualizar items y establecer relaciones con rendimiento
-        foreach ($partidas as $partida) {
-            if (isset($createdModules[$partida['id_modulo']])) {
-                $moduloId = $createdModules[$partida['id_modulo']];
-                
-                // Limpiar campos
-                $descripcionLimpia = $this->cleanString($partida['descripcion']);
-                $unidadLimpia = $this->cleanString($partida['unidad']);
-                
-                // Buscar/crear item por descripcion + unidad
-                $item = ObraItem::whereRaw('TRIM(descripcion) = ?', [$descripcionLimpia])
-                                ->whereRaw('TRIM(unidad) = ?', [$unidadLimpia])
-                                ->first();
+        Log::info("✓ Módulos creados: " . count($createdModules));
 
-                if ($item) {
-                    // Si existe, actualizar sus datos
-                    $item->update([
-                        'descripcion' => $descripcionLimpia,
-                        'unidad' => $unidadLimpia,
-                        'rendimiento' => $partida['rendimiento'],
-                        'activo' => true
-                    ]);
-                } else {
-                    // Si no existe, crear nuevo con código único
-                    $codigoBase = 'ITEM_' . str_pad($partida['id'], 4, '0', STR_PAD_LEFT);
-                    $codigoUnico = $codigoBase;
-                    $contador = 1;
-                    
-                    // Verificar si el código ya existe y ajustar
-                    while (ObraItem::where('codigo', $codigoUnico)->exists()) {
-                        $sufijo = '_' . $contador;
-                        $codigoUnico = substr($codigoBase, 0, 50 - strlen($sufijo)) . $sufijo;
-                        $contador++;
-                    }
-                    
-                    $item = ObraItem::create([
-                        'codigo' => $codigoUnico,
-                        'descripcion' => $descripcionLimpia,
-                        'unidad' => $unidadLimpia,
-                        'rendimiento' => $partida['rendimiento'],
-                        'activo' => true
-                    ]);
+        // 5. Crear/actualizar items y establecer relaciones con recursos
+        $itemsCreados = 0;
+        $itemsActualizados = 0;
+        $itemsSinModulo = 0;
+        $itemsSinRecursos = 0;
+        
+        // 👇 CORRECCIÓN CRÍTICA: USAR id_relacionado COMO OFFSET, NO $index
+        foreach ($partidas as $index => $partida) {
+            Log::info("Procesando partida #{$index}: '{$partida['descripcion']}' (offset DAT: {$partida['id_relacionado']}, módulo: {$partida['id_modulo']})");
+            
+            if (!isset($createdModules[$partida['id_modulo']])) {
+                Log::warning("  ⚠️ Módulo {$partida['id_modulo']} no existe");
+                $itemsSinModulo++;
+                continue;
+            }
+            
+            $moduloId = $createdModules[$partida['id_modulo']];
+            $descripcionLimpia = $this->cleanLatin1String($partida['descripcion']);
+            $unidadLimpia = $partida['unidad'];
+            
+            $item = ObraItem::whereRaw('TRIM(descripcion) = ?', [$descripcionLimpia])
+                            ->whereRaw('TRIM(unidad) = ?', [$unidadLimpia])
+                            ->first();
+
+            if ($item) {
+                /*$item->update(['descripcion' => $descripcionLimpia, 'unidad' => $unidadLimpia, 'activo' => true]);
+                Log::info("  ↳ Item existente actualizado: {$item->id} - {$descripcionLimpia}");
+                $itemsActualizados++;*/
+                $codigoBase = 'ITEM_' . str_pad($partida['id'], 4, '0', STR_PAD_LEFT);
+                $codigoUnicoItem = $codigoBase;
+                $contador = 1;
+                
+                while (ObraItem::where('codigo', $codigoUnicoItem)->exists()) {
+                    $sufijo = '_' . $contador;
+                    $codigoUnicoItem = substr($codigoBase, 0, 50 - strlen($sufijo)) . $sufijo;
+                    $contador++;
                 }
                 
-                // Establecer relación con el módulo incluyendo rendimiento
-                $modulo = ObraModulo::find($moduloId);
-                $modulo->items()->syncWithoutDetaching([
-                    $item->id => [
-                        'orden' => $partida['id'],
-                        'rendimiento' => $partida['rendimiento'] // 👈 RENDIMIENTO DE LA RELACIÓN
-                    ]
+                $item = ObraItem::create([
+                    'codigo' => $codigoUnicoItem,
+                    'descripcion' => $descripcionLimpia,
+                    'unidad' => $unidadLimpia,
+                    'activo' => true
                 ]);
-
-                // 👇 ESTABLECER RELACIONES CON RECURSOS
-                $itemIdIndex = $index + 1; // Los items en .DAT empiezan desde 1
-                if (isset($datosDat['recursos_por_item'][$itemIdIndex])) {
-                    $relaciones = $datosDat['recursos_por_item'][$itemIdIndex];
-                    
-                    // Combinar todos los recursos del item
-                    $todosRecursos = array_merge(
-                        $relaciones['materiales'],
-                        $relaciones['mano_obra'], 
-                        $relaciones['equipos']
-                    );
-                    
-                    if (!empty($todosRecursos)) {
-                        $recursosParaRelacionar = [];
-                        foreach ($todosRecursos as $recursoRel) {
-                            // Encontrar el recurso real por su posición en el .IND
-                            if (isset($insumos[$recursoRel['recurso_id'] - 1])) {
-                                $recursoNombre = $insumos[$recursoRel['recurso_id'] - 1]['descripcion'];
-                                $recursoUnidad = $insumos[$recursoRel['recurso_id'] - 1]['unidad'];
-                                
-                                $recursoReal = ObraRecursoMaestro::whereRaw('TRIM(nombre) = ?', [$recursoNombre])
-                                                                ->whereRaw('TRIM(unidad) = ?', [$recursoUnidad])
-                                                                ->first();
-                                
-                                if ($recursoReal) {
-                                    $recursosParaRelacionar[$recursoReal->id] = [
-                                        'rendimiento' => $recursoRel['rendimiento']
-                                    ];
-                                }
-                            }
-                        }
-                        
-                        if (!empty($recursosParaRelacionar)) {
-                            $item->recursos()->sync($recursosParaRelacionar);
-                        }
-                    }
+                Log::info("  ↳ Item nuevo creado: {$item->id} - {$descripcionLimpia} (código: {$codigoUnicoItem})");
+                $itemsCreados++;
+            } else {
+                $codigoBase = 'ITEM_' . str_pad($partida['id'], 4, '0', STR_PAD_LEFT);
+                $codigoUnicoItem = $codigoBase;
+                $contador = 1;
+                
+                while (ObraItem::where('codigo', $codigoUnicoItem)->exists()) {
+                    $sufijo = '_' . $contador;
+                    $codigoUnicoItem = substr($codigoBase, 0, 50 - strlen($sufijo)) . $sufijo;
+                    $contador++;
                 }
+                
+                $item = ObraItem::create([
+                    'codigo' => $codigoUnicoItem,
+                    'descripcion' => $descripcionLimpia,
+                    'unidad' => $unidadLimpia,
+                    'activo' => true
+                ]);
+                Log::info("  ↳ Item nuevo creado: {$item->id} - {$descripcionLimpia} (código: {$codigoUnicoItem})");
+                $itemsCreados++;
+            }
+            
+            // Establecer relación con el módulo
+            $modulo = ObraModulo::find($moduloId);
+            if ($modulo) {
+                $modulo->items()->syncWithoutDetaching([
+                    $item->id => ['orden' => $partida['id'], 'rendimiento' => $partida['rendimiento'] ?? 1.0]
+                ]);
+                Log::info("  → Relación item-módulo establecida (rendimiento: {$partida['rendimiento']})");
+            }
 
+            // 👇 CORRECCIÓN DEFINITIVA: USAR id_relacionado COMO OFFSET BASE
+            $insumosItem = $this->obtenerInsumosItem(
+                $registrosDat,
+                $partida['id_relacionado'],  // 👈 OFFSET BASE DEL PRE, NO $index
+                $insumos
+            );
 
+            if (empty($insumosItem)) {
+                Log::warning("  ⚠️ Item {$index} sin recursos (offset: {$partida['id_relacionado']})");
+                $itemsSinRecursos++;
+                continue;
+            }
+            
+            Log::info("  → Recursos encontrados para item {$index} (offset {$partida['id_relacionado']}): " . count($insumosItem));
+            
+            $recursosParaRelacionar = [];
+            foreach ($insumosItem as $insumo) {
+                // 👇 BUSCAR POR ID REAL DEL DAT (no por posición)
+                $recursoId = $recursosMap[$insumo['id_insumo']] ?? null;  // $insumo['id_insumo'] = ID real del DAT
+                
+                if ($recursoId) {
+                    $recursosParaRelacionar[$recursoId] = ['rendimiento' => $insumo['coeficiente']];
+                    Log::info("    ↳ Recurso relacionado: ID DAT {$insumo['id_insumo']} → BD {$recursoId} (rendimiento: {$insumo['coeficiente']})");
+                } else {
+                    Log::warning("    ⚠️ Recurso ID {$insumo['id_insumo']} no encontrado en mapa (¿fuera de rango?)");
+                }
+            }
+            
+            if (!empty($recursosParaRelacionar)) {
+                $item->recursos()->sync($recursosParaRelacionar);
+                Log::info("  ✓ Relaciones item-recursos establecidas: " . count($recursosParaRelacionar));
+            } else {
+                Log::warning("  ⚠️ No se encontraron recursos válidos para relacionar");
             }
         }
-        // Establecer relaciones item → recursos
-        $this->crearRelacionesItemRecursos($relaciones, $partidas, $insumos);
-        $extractedPath = $request->extracted_path;
 
-         // ✅ LIMPIAR SOLO DESPUÉS DE IMPORTAR TODO
-         //$this->cleanupTempFiles(storage_path('app/temp/' . basename(dirname($extractedPath))), $extractedPath);
-
+        Log::info("✓ Resumen final:");
+        Log::info("  - Items creados: {$itemsCreados}");
+        Log::info("  - Items actualizados: {$itemsActualizados}");
+        Log::info("  - Items sin módulo: {$itemsSinModulo}");
+        Log::info("  - Items sin recursos: {$itemsSinRecursos} de " . count($partidas));
 
         return response()->json([
             'success' => true,
@@ -1256,87 +738,234 @@ public function importCompleteProject(Request $request)
             'stats' => [
                 'recursos' => count($insumos),
                 'modulos' => count($createdModules),
-                'items' => count($partidas)
+                'items_creados' => $itemsCreados,
+                'items_actualizados' => $itemsActualizados,
+                'items_sin_recursos' => $itemsSinRecursos
             ]
         ]);
 
     } catch (\Exception $e) {
-        // ✅ TAMBIÉN LIMPIAR EN CASO DE ERROR
-        if (isset($extractedPath)) {
-            $this->cleanupTempFiles(storage_path('app/temp/' . basename(dirname($extractedPath))), $extractedPath);
-        }
-        return response()->json(['error' => 'Error al importar el proyecto: ' . $e->getMessage()], 500);
-    }
-}
-private function crearRelacionesItemRecursos($relaciones, $partidas, $insumos)
-{
-    // Agrupar relaciones por item
-    $relacionesPorItem = [];
-    foreach ($relaciones as $rel) {
-        $itemId = $rel['item'];
-        if (!isset($relacionesPorItem[$itemId])) {
-            $relacionesPorItem[$itemId] = [];
-        }
-        $relacionesPorItem[$itemId][] = $rel;
-    }
-    
-    // Procesar cada item
-    foreach ($partidas as $index => $partida) {
-        $itemId = $index + 1; // Los items en .DAT empiezan desde 1
+        Log::error('❌ Error FATAL: ' . $e->getMessage());
+        Log::error('Stack: ' . $e->getTraceAsString());
         
-        if (isset($relacionesPorItem[$itemId])) {
-            // Buscar el item real en la base de datos
-            $descripcionLimpia = $this->cleanString($partida['descripcion']);
-            $unidadLimpia = $this->cleanString($partida['unidad']);
-            
-            $item = ObraItem::whereRaw('TRIM(descripcion) = ?', [$descripcionLimpia])
-                            ->whereRaw('TRIM(unidad) = ?', [$unidadLimpia])
-                            ->first();
-            
-            if ($item) {
-                $recursosParaRelacionar = [];
-                
-                foreach ($relacionesPorItem[$itemId] as $rel) {
-                    // Encontrar el recurso por ID relacionado
-                    foreach ($insumos as $insumo) {
-                        if ($insumo['id_relacionado'] == $rel['id_insumo']) {
-                            $recursoNombre = $this->cleanString($insumo['descripcion']);
-                            $recursoUnidad = $this->cleanString($insumo['unidad']);
-                            
-                            $recurso = ObraRecursoMaestro::whereRaw('TRIM(nombre) = ?', [$recursoNombre])
-                                                        ->whereRaw('TRIM(unidad) = ?', [$recursoUnidad])
-                                                        ->first();
-                            
-                            if ($recurso) {
-                                $recursosParaRelacionar[$recurso->id] = [
-                                    'rendimiento' => $rel['rendimiento']
-                                ];
-                            }
-                            break;
-                        }
-                    }
-                }
-                
-                if (!empty($recursosParaRelacionar)) {
-                    $item->recursos()->sync($recursosParaRelacionar);
-                }
-            }
-        }
+        return response()->json([
+            'error' => 'Error al importar el proyecto',
+            'debug' => config('app.debug') ? $e->getMessage() : null
+        ], 500);
     }
-}
-private function cleanString($string)
-{
-    if (!$string) {
-        return '';
-    }
-    
-    // Eliminar caracteres de control (ASCII 0-31) excepto espacios, tabs y newlines
-    $clean = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $string);
-    
-    // Eliminar espacios múltiples y trim
-    $clean = preg_replace('/\s+/', ' ', $clean);
-    
-    return trim($clean);
 }
 
+    // ========================================================================
+    // OTROS MÉTODOS EXISTENTES (MANTENIDOS)
+    // ========================================================================
+
+    public function importDdp(Request $request)
+    {
+        Log::info('Iniciando importación DDP');
+        try {
+            // Validar archivo
+            $request->validate([
+                'file' => 'required|file'
+            ]);
+            Log::info('Archivo recibido, validación pasada');
+            
+            // Obtener el archivo directamente sin store()
+            $uploadedFile = $request->file('file');
+            
+            // Verificar que el archivo se haya subido correctamente
+            if (!$uploadedFile->isValid()) {
+                Log::error('Archivo no válido: ' . $uploadedFile->getErrorMessage());
+                return response()->json(['error' => 'Archivo .DDP inválido'], 400);
+            }
+            
+            // Crear directorio temporal
+            $tempDir = storage_path('app/temp/' . uniqid());
+            if (!is_dir($tempDir)) {
+                mkdir($tempDir, 0755, true);
+            }
+            
+            // Guardar archivo temporalmente
+            $tempFilePath = $tempDir . '/archivo.ddp';
+            $uploadedFile->move($tempDir, 'archivo.ddp');
+            Log::info('Archivo movido a: ' . $tempFilePath);
+            
+            // Verificar que el archivo exista
+            if (!file_exists($tempFilePath)) {
+                Log::error('Archivo no existe después de mover: ' . $tempFilePath);
+                return response()->json(['error' => 'Error al guardar el archivo temporal'], 500);
+            }
+            
+            $fileSize = filesize($tempFilePath);
+            Log::info('Tamaño del archivo: ' . $fileSize . ' bytes');
+            if ($fileSize === 0) {
+                Log::error('Archivo vacío');
+                return response()->json(['error' => 'Archivo .DDP vacío'], 400);
+            }
+            
+            // Verificar firma ZIP
+            $fileHeader = file_get_contents($tempFilePath, false, null, 0, 4);
+            $zipSignature = "\x50\x4B\x03\x04";
+            if ($fileHeader !== $zipSignature) {
+                Log::error('Archivo no es ZIP válido. Header: ' . bin2hex($fileHeader));
+                return response()->json(['error' => 'Archivo .DDP inválido. No es un archivo ZIP válido.'], 400);
+            }
+            
+            Log::info('Archivo ZIP válido detectado');
+            
+            // Descomprimir ZIP
+            $zip = new ZipArchive();
+            $openResult = $zip->open($tempFilePath);
+            if ($openResult !== true) {
+                $errorMessages = [
+                    ZipArchive::ER_EXISTS => 'El archivo ya existe',
+                    ZipArchive::ER_INCONS => 'Archivo ZIP inconsistente',
+                    ZipArchive::ER_INVAL => 'Argumento inválido',
+                    ZipArchive::ER_MEMORY => 'Fallo de memoria',
+                    ZipArchive::ER_NOENT => 'No existe',
+                    ZipArchive::ER_NOZIP => 'No es un archivo ZIP',
+                    ZipArchive::ER_OPEN => 'No se puede abrir el archivo',
+                    ZipArchive::ER_READ => 'Error al leer el archivo',
+                    ZipArchive::ER_SEEK => 'Error al buscar en el archivo'
+                ];
+                $errorMessage = $errorMessages[$openResult] ?? 'Error desconocido';
+                Log::error('Error al abrir ZIP (' . $openResult . '): ' . $errorMessage);
+                return response()->json(['error' => 'Error al abrir el archivo: ' . $errorMessage], 400);
+            }
+            
+            Log::info('ZIP abierto correctamente');
+            
+            // Extraer contenido
+            $extractPath = storage_path('app/temp/extracted/' . uniqid());
+            if (!is_dir(dirname($extractPath))) {
+                mkdir(dirname($extractPath), 0755, true);
+            }
+            $zip->extractTo($extractPath);
+            $zip->close();
+            Log::info('Contenido extraído a: ' . $extractPath);
+            
+            // Buscar archivo .STT
+            $sttFile = $this->findSttFile($extractPath);
+            if (!$sttFile) {
+                Log::warning('No se encontró archivo .STT en: ' . $extractPath);
+                $this->listDirectories($extractPath);
+                return response()->json(['error' => 'No se encontró archivo .STT'], 400);
+            }
+            
+            Log::info('Archivo .STT encontrado: ' . $sttFile);
+            
+            // Extraer nombre de categoría
+            $nombreCategoria = $this->extractCategoryName($sttFile);
+            if (!$nombreCategoria) {
+                Log::error('No se pudo extraer nombre de categoría');
+                return response()->json(['error' => 'No se pudo extraer el nombre de la categoría'], 400);
+            }
+            
+            Log::info('Nombre de categoría extraído: ' . $nombreCategoria);
+            
+            // Limpiar archivos temporales
+            // $this->cleanupTempFiles($tempFilePath, $extractPath);
+            
+            return response()->json([
+                'success' => true,
+                'nombre_categoria' => $nombreCategoria,
+                'extracted_path' => $extractPath,
+                'preview' => [
+                    'categoria' => $nombreCategoria,
+                    'mensaje' => 'Listo para crear categoría'
+                ]
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Error en importDdp: ' . $e->getMessage() . ' en ' . $e->getFile() . ':' . $e->getLine());
+            return response()->json(['error' => 'Error al procesar el archivo'], 500);
+        }
+    }
+
+    private function findSttFile($extractPath)
+    {
+        Log::info('Buscando .STT en: ' . $extractPath);
+        $prescomPath = $extractPath . '/PRESCOM_2013/temporal';
+        Log::info('Ruta PRESCOM_2013: ' . $prescomPath);
+        
+        if (!is_dir($prescomPath)) {
+            Log::warning('Directorio PRESCOM_2013/temporal no existe');
+            return null;
+        }
+        
+        // Buscar .STT en mayúsculas
+        $files = glob($prescomPath . '/*.STT');
+        Log::info('Archivos .STT encontrados: ' . count($files));
+        if (!empty($files)) {
+            return $files[0];
+        }
+        
+        // Buscar en minúsculas
+        $files = glob($prescomPath . '/*.stt');
+        if (!empty($files)) {
+            return $files[0];
+        }
+        
+        return null;
+    }
+
+    private function listDirectories($path)
+    {
+        if (!is_dir($path)) return;
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($path, \RecursiveDirectoryIterator::SKIP_DOTS)
+        );
+        foreach ($iterator as $file) {
+            Log::info('Archivo encontrado: ' . $file->getPathname());
+        }
+    }
+
+    private function extractCategoryName($sttFilePath)
+    {
+        try {
+            Log::info('Extrayendo nombre de: ' . $sttFilePath);
+            if (!file_exists($sttFilePath)) {
+                Log::error('Archivo .STT no existe: ' . $sttFilePath);
+                return null;
+            }
+            
+            $handle = fopen($sttFilePath, 'rb');
+            if (!$handle) {
+                Log::error('No se pudo abrir archivo .STT: ' . $sttFilePath);
+                return null;
+            }
+            
+            $data = fread($handle, 70);
+            fclose($handle);
+            
+            if (strlen($data) < 70) {
+                Log::warning('Archivo .STT muy corto: ' . strlen($data) . ' bytes');
+                return null;
+            }
+            
+            // Decodificar con latin-1 (ISO-8859-1)
+            $nombre = mb_convert_encoding(substr($data, 0, 70), 'UTF-8', 'ISO-8859-1');
+            $nombre = trim($nombre);
+            Log::info('Nombre extraído: "' . $nombre . '"');
+            return $nombre ?: null;
+        } catch (Exception $e) {
+            Log::error('Error extrayendo nombre: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    private function deleteDirectory($dir)
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        $files = array_diff(scandir($dir), ['.', '..']);
+        foreach ($files as $file) {
+            $path = $dir . '/' . $file;
+            if (is_dir($path)) {
+                $this->deleteDirectory($path);
+            } else {
+                unlink($path);
+            }
+        }
+        rmdir($dir);
+    }
 }

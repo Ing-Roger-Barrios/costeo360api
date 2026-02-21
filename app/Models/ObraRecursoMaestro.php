@@ -55,6 +55,11 @@ class ObraRecursoMaestro extends Model
                     ->withPivot('precio_regional')
                     ->withTimestamps();
     }
+    public function versionesRegiones()
+    {
+        return $this->hasMany(VersionRecursoRegion::class, 'obra_recurso_maestro_id');
+    }
+
 
     // Obtener precio para una región específica
     public function getPrecioPorRegion($regionId)

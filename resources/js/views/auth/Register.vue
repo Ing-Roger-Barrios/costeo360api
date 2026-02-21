@@ -74,42 +74,65 @@ import { ref } from 'vue';
 import { useRouter } from 'vue-router';
 import axios from 'axios';
 import AuthCard from '../../components/AuthCard.vue';
+import { useAuthStore } from '../../stores/auth'; // 👈 IMPORTAR EL STORE
 
+const router = useRouter();
+const authStore = useAuthStore(); // 👈 INICIALIZAR EL STORE
 const form = ref({ 
   name: '', 
   email: '', 
   password: '', 
-  password_confirmation: '' 
+  password_confirmation: '',
+  first_name: '',
+  last_name: ''
 });
 const loading = ref(false);
 const error = ref(null);
-const router = useRouter();
 
 const handleRegister = async () => {
-  // Validación básica
-  if (form.value.password !== form.value.password_confirmation) {
-    error.value = 'Las contraseñas no coinciden';
-    return;
-  }
-  
   loading.value = true;
   error.value = null;
   
   try {
     const response = await axios.post('/api/v1/auth/register', form.value);
     
-    // Auto-login después del registro
-    const loginResponse = await axios.post('/api/v1/auth/login', {
-      email: form.value.email,
-      password: form.value.password
-    });
+    console.log('✅ Respuesta del servidor:', response.data);
     
-    localStorage.setItem('token', loginResponse.data.access_token);
-    localStorage.setItem('user', JSON.stringify(loginResponse.data.user));
+    // Guardar token y usuario en localStorage
+    localStorage.setItem('token', response.data.access_token);
+    localStorage.setItem('user', JSON.stringify(response.data.user));
+    axios.defaults.headers.common['Authorization'] = `Bearer ${response.data.access_token}`;
     
-    router.push('/');
+    // 👇 ACTUALIZAR EL STORE DE AUTENTICACIÓN
+    authStore.token = response.data.access_token;
+    authStore.user = response.data.user;
+    authStore.isAuthenticated = true;
+    
+    // Redirigir según verificación de email
+    if (response.data.email_verified) {
+      // Verificar rol y redirigir
+      if (authStore.isAdmin) {
+        router.push('/dashboard');
+      } else if (authStore.isUser) {
+        router.push('/my-licenses');
+      } else {
+        router.push('/');
+      }
+    } else {
+      // Mostrar URL en consola solo en desarrollo
+      if (response.data.verification_url_for_dev) {
+        console.log('🔗 URL de verificación (desarrollo):', response.data.verification_url_for_dev);
+      }
+      router.push('/verify-email');
+    }
   } catch (err) {
-    error.value = err.response?.data?.message || 'Error al crear la cuenta';
+    console.error('❌ Error completo:', err);
+    console.error('❌ Response data:', err.response?.data);
+    console.error('❌ Status:', err.response?.status);
+    
+    error.value = err.response?.data?.message || 
+                  err.response?.data?.error || 
+                  'Error al crear la cuenta';
   } finally {
     loading.value = false;
   }

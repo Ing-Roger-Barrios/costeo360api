@@ -31,6 +31,7 @@
       >
         {{ loading ? 'Iniciando...' : 'Iniciar Sesión' }}
       </button>
+
     </form>
     
     <div class="mt-4 text-center">
@@ -38,6 +39,12 @@
         ¿No tienes cuenta? 
         <router-link to="/register" class="text-primary font-medium hover:text-primary-medium">
           Regístrate aquí
+        </router-link>
+      </p>
+      <p class="text-gray-600 mt-2">
+        ¿Olvidaste tu contraseña? 
+        <router-link to="/forgot-password" class="text-primary font-medium hover:text-primary-medium">
+          Restablecer
         </router-link>
       </p>
     </div>

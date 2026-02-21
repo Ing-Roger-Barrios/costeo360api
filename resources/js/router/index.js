@@ -21,6 +21,24 @@ const routes = [
         meta: { guest: true }
     },
     {
+        path: '/forgot-password',
+        name: 'forgot-password',
+        component: () => import('../views/auth/ForgotPassword.vue'),
+        meta: { guest: true }
+    },
+    {
+        path: '/reset-password',
+        name: 'reset-password',
+        component: () => import('../views/auth/ResetPassword.vue'),
+        meta: { guest: true }
+    },
+    {
+        path: '/verify-email',
+        name: 'verify-email',
+        component: () => import('../views/auth/VerifyEmail.vue'),
+        meta: { requiresAuth: true }
+    },
+    {
         // 👇 Layout principal con Sidebar y Header
         path: '/dashboard',
         component: () => import('../views/dashboard/DashboardLayout.vue'), // Cambiado a Layout
@@ -55,6 +73,11 @@ const routes = [
                 path: 'categories',
                 name: 'categories',
                 component: () => import('../views/categories/CategoriesView.vue')
+            },
+            {
+                path: '/categories/:id/presupuesto',
+                name: 'category.presupuesto',
+                component: () => import('@/views/CategoriaView.vue')
             },
             {
                 path: 'versions',
@@ -96,12 +119,14 @@ const routes = [
         {
             path: '',
             name: 'my-licenses',
-            component: () => import('../views/licenses/MyLicenses.vue')
+            component: () => import('../views/licenses/MyLicenses.vue'),
+            meta: { requiresVerifiedEmail: true }
         },
         {
             path: 'purchase',
             name: 'purchase-license',
-            component: () => import('../views/licenses/PurchaseLicense.vue')
+            component: () => import('../views/licenses/PurchaseLicense.vue'),
+            meta: { requiresVerifiedEmail: true }
         },
         {
             path: ':type/payment',

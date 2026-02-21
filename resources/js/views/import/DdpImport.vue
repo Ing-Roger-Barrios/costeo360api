@@ -150,7 +150,7 @@ const createCategory = async () => {
       showConfirmButton: false
     });
 
-    router.push('/categories');
+    router.push('/dashboard/categories');
     
   } catch (error) {
     console.error('Error detallado:', error.response?.data);

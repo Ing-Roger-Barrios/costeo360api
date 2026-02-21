@@ -8,12 +8,19 @@ use App\Http\Controllers\LicenseController;
 // Recursos Maestros
 Route::prefix('v1')->group(function () {
     // 👇 RUTAS PÚBLICAS (sin autenticación)
-    Route::prefix('auth')->group(function () {
+    //Route::prefix('auth')->group(function () {
+    Route::prefix('auth')->middleware('throttle:5,1')->group(function () {
         Route::post('/register', [API\AuthController::class, 'register']);
         Route::post('/login', [API\AuthController::class, 'login']);
+        
     });
+    Route::post('/auth/forgot-password', [API\AuthController::class, 'forgotPassword']);
+    Route::post('/auth/reset-password', [API\AuthController::class, 'resetPassword']);
+    Route::post('/verification-notification', [API\AuthController::class, 'sendVerificationEmail']);
+    Route::get('/auth/verify-email', [API\AuthController::class, 'verifyEmail']);
     // Ruta pública para descargar el archivo (requiere autenticación previa)
-    Route::middleware('auth:sanctum')->get('/download/file', [DownloadController::class, 'getDownloadFile'])
+    //Route::middleware('auth:sanctum')->get('/download/file', [DownloadController::class, 'getDownloadFile'])
+    Route::middleware(['auth:sanctum', 'throttle:10,1'])->get('/download/file', [DownloadController::class, 'getDownloadFile'])
         ->name('download.desktop.file');
     
     // 👇 RUTAS PROTEGIDAS (con autenticación)
@@ -36,6 +43,11 @@ Route::prefix('v1')->group(function () {
         
         // Categorías
         Route::apiResource('/categories', API\CategoryController::class);
+
+        Route::get(
+            '/categories/{category}/presupuesto-estructura',
+            [API\CategoryController::class, 'presupuestoEstructura']
+        );
         
         // Versiones
         Route::get('/versions/active', [API\VersionController::class, 'getActiveVersion']);
@@ -83,5 +95,11 @@ Route::prefix('v1')->group(function () {
 
         // Ruta para verificar y obtener URL de descarga
         Route::get('/download/desktop', [DownloadController::class, 'downloadDesktopAppApi']);
+
+
+        // Verificación de email
+        
+        Route::post('/auth/resend-verification', [AuthController::class, 'resendVerificationEmail']);
+
     });
 });

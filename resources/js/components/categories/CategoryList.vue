@@ -79,6 +79,19 @@
               {{ category.activo ? 'Activa' : 'Inactiva' }}
             </span>
 
+            <!-- NUEVO BOTÓN -->
+            <router-link
+              :to="{
+                name: 'category.presupuesto',
+                params: { id: category.id }
+              }"
+              class="inline-flex items-center px-3 py-1.5 text-xs font-medium rounded-md
+                    bg-indigo-600 text-white hover:bg-indigo-700
+                    transition-colors duration-200"
+            >
+              Presupuesto
+            </router-link>
+
             <button
               @click="$emit('edit', category)"
               class="p-2 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-full transition-colors"

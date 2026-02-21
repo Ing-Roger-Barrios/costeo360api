@@ -98,7 +98,7 @@ const downloadApp = () => {
 };
 
 const goToLicenses = () => {
-  router.push('/my-licenses');
+  router.push('/licenses');
 };
 
 const fetchLicense = async () => {

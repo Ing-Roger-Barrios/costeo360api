@@ -5,7 +5,9 @@ namespace App\Http\Controllers\API;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\CategoryResource;
 use App\Models\ObraCategoria;
+use App\Models\Region;
 use App\Models\Version;
+use App\Services\PricingService;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
@@ -83,6 +85,8 @@ class CategoryController extends Controller
         $categoria->precio_total = $categoria->modulos->sum('precio_total');
         return response()->json(['data' => $categoria->load('modulos.items.recursos')]);
     }
+
+   
 
     /**
      * Update the specified resource in storage.
@@ -172,4 +176,98 @@ class CategoryController extends Controller
             'catalogo' => $catalogo
         ]);
     }
+
+
+
+
+    public function presupuestoEstructura($categoryId)
+    {
+        $categoria = ObraCategoria::with([
+            'modulos.items.recursos.versiones',
+            'modulos.items.recursos.preciosRegionales',
+            'modulos.items.recursos.versionesRegiones'
+        ])->findOrFail($categoryId);
+
+
+
+        $regiones = Region::where('activo', true)->get([
+            'id', 'codigo', 'nombre'
+        ]);
+
+        $versiones = Version::orderBy('id', 'desc')->get(['id', 'version', 'nombre']);
+        //$versiones = Version::all(['id', 'version', 'nombre']);
+        
+
+        return response()->json([
+            'categoria' => [
+                'id'     => $categoria->id,
+                'codigo' => $categoria->codigo,
+                'nombre' => $categoria->nombre,
+            ],
+            'regiones'  => $regiones,
+            'versiones'=> $versiones,
+            'modulos'  => $this->mapearModulos($categoria)
+        ]);
+    }
+    private function mapearModulos($categoria)
+    {
+        return $categoria->modulos->map(function ($modulo) {
+
+            return [
+                'id'     => $modulo->id,
+                'codigo' => $modulo->codigo,
+                'nombre' => $modulo->nombre,
+                'orden'  => $modulo->pivot->orden,
+                'items'  => $modulo->items->map(function ($item) use ($modulo) {
+
+                    return [
+                        'id' => $item->id,
+                        'codigo' => $item->codigo,
+                        'descripcion' => $item->descripcion,
+                        'unidad' => $item->unidad,
+
+                        // 👇 rendimiento del módulo
+                        'rendimiento_modulo' => $item->pivot->rendimiento,
+
+                        'recursos' => $item->recursos->map(function ($recurso) {
+
+                            return [
+                                'id'     => $recurso->id,
+                                'codigo' => $recurso->codigo,
+                                'nombre' => $recurso->nombre,
+                                'tipo'   => $recurso->tipo,
+                                'unidad' => $recurso->unidad,
+
+                                'rendimiento_recurso' =>
+                                    $recurso->pivot->rendimiento ?? 0,
+
+                                'precio_referencia' =>
+                                    $recurso->precio_referencia ?? 0,
+
+                                // 👇 MAPAS SEGUROS
+
+                                'precios_version' =>
+                                    collect($recurso->versiones)
+                                        ->pluck('precio_version', 'id'),
+
+                                'precios_region' =>
+                                    collect($recurso->regiones)
+                                        ->pluck('precio_regional', 'id'),
+
+                                'precios_version_region' =>
+                                    collect($recurso->versionesRegiones)
+                                        ->mapWithKeys(fn ($vr) => [
+                                            $vr->version_id . '_' . $vr->region_id
+                                                => $vr->precio_version_regional
+                                        ]),
+
+                            ];
+
+                        })
+                    ];
+                })
+            ];
+        });
+    }
+
 }

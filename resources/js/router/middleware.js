@@ -13,10 +13,15 @@ export const authMiddleware = async (to, from, next) => {
       next('/login');
       return;
     }
+      // Verificar email si es necesario
+    if (to.meta.requiresVerifiedEmail && !authStore.user?.email_verified) {
+      next('/verify-email');
+      return;
+    }
     
     // Protección por roles
     if (to.meta.requiresAdmin && !authStore.isAdmin) {
-      next(authStore.isUser ? '/my-licenses' : '/login');
+      next(authStore.isUser ? '/licenses' : '/login');
       return;
     }
     
@@ -31,7 +36,7 @@ export const authMiddleware = async (to, from, next) => {
     if (authStore.isAdmin) {
       next('/dashboard');
     } else if (authStore.isUser) {
-      next('/my-licenses');
+      next('/licenses');
     } else {
       next('/');
     }

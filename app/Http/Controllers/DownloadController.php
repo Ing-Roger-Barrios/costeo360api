@@ -5,12 +5,11 @@ namespace App\Http\Controllers;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Storage;
-use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 class DownloadController extends Controller
 {
-    public function downloadDesktopAppApi(Request $request)
+    //public function downloadDesktopAppApi(Request $request)
+    private function validateDesktopDownloadAccess(Request $request)
     {
         // Verificar autenticación
         if (!Auth::check()) {
@@ -57,7 +56,19 @@ class DownloadController extends Controller
             ], 404);
         }
 
-        // Registrar descarga
+         return null;
+    }
+
+    public function downloadDesktopAppApi(Request $request)
+    {
+        $validationResponse = $this->validateDesktopDownloadAccess($request);
+        if ($validationResponse) {
+            return $validationResponse;
+        }
+
+        $user = Auth::user();
+        $filePath = public_path('downloads/costeo360.exe');
+
         Log::info('Descarga iniciada', [
             'user_id' => $user->id,
             'user_email' => $user->email,
@@ -78,16 +89,13 @@ class DownloadController extends Controller
     public function getDownloadFile(Request $request)
     {
         // Esta ruta solo verifica que el usuario esté autenticado
-        if (!Auth::check()) {
-            abort(401);
-        }
+        $validationResponse = $this->validateDesktopDownloadAccess($request);
 
+        if ($validationResponse) {
+            return $validationResponse;
+        }
         $filePath = public_path('downloads/costeo360.exe');
         
-        if (!file_exists($filePath)) {
-            abort(404);
-        }
-
         return response()->download($filePath, 'costeo360.exe', [
             'Content-Type' => 'application/octet-stream',
             'Content-Disposition' => 'attachment; filename="costeo360.exe"'
